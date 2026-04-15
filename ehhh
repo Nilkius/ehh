@@ -1,0 +1,174 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/uart.h"
+
+#include "hx711.h"
+
+// =======================
+// ⚙️ KONFIGURACJA
+// =======================
+#define UART_PORT UART_NUM_0
+
+#define FAST_ALPHA 0.5f
+#define SLOW_ALPHA 0.05f
+
+#define STABLE_THRESHOLD 2000
+#define ZERO_THRESHOLD 0.02f
+#define ZERO_TIME_MS 1000
+
+// =======================
+// 🔢 ZMIENNE GLOBALNE
+// =======================
+static float filtered = 0;
+static float displayed = 0;
+
+static int32_t offset = 0;
+static float scale = 1.0f;
+
+static int stable_counter = 0;
+static int zero_counter = 0;
+
+// =======================
+// ⚖️ TARA
+// =======================
+void hx711_tare(hx711_t *dev)
+{
+    int32_t raw;
+    hx711_read_average(dev, 15, &raw);
+
+    offset = raw;
+
+    // reset filtrów
+    filtered = raw;
+    displayed = 0;
+
+    stable_counter = 0;
+    zero_counter = 0;
+
+    printf("Tare done\n");
+}
+
+// =======================
+// 📏 KALIBRACJA
+// =======================
+void hx711_calibrate(hx711_t *dev, float known_weight)
+{
+    int32_t raw;
+    hx711_read_average(dev, 20, &raw);
+
+    scale = (raw - offset) / known_weight;
+
+    printf("Calibrated! scale = %f\n", scale);
+}
+
+// =======================
+// 🧠 FILTR „JAK WAGA”
+// =======================
+float hx711_get_units_smart(hx711_t *dev)
+{
+    int32_t raw;
+    hx711_read_average(dev, 3, &raw);
+
+    float diff = fabs(filtered - raw);
+
+    // adaptacyjny filtr
+    float alpha = (diff > STABLE_THRESHOLD) ? FAST_ALPHA : SLOW_ALPHA;
+    filtered = alpha * raw + (1 - alpha) * filtered;
+
+    float weight = (filtered - offset) / scale;
+
+    // =========================
+    // 🔒 STABILIZACJA (HOLD)
+    // =========================
+    if (diff < STABLE_THRESHOLD)
+        stable_counter++;
+    else
+        stable_counter = 0;
+
+    if (stable_counter > 5)
+        displayed = weight;
+    else
+        displayed = weight;
+
+    // =========================
+    // ⚖️ AUTO ZERO
+    // =========================
+    if (fabs(displayed) < ZERO_THRESHOLD)
+        zero_counter++;
+    else
+        zero_counter = 0;
+
+    if (zero_counter > (ZERO_TIME_MS / 50))
+    {
+        offset = filtered;
+        displayed = 0;
+    }
+
+    // szybkie zerowanie przy minusie
+    if (displayed < -ZERO_THRESHOLD)
+    {
+        offset = filtered;
+        displayed = 0;
+    }
+
+    return displayed;
+}
+
+// =======================
+// 💻 UART KOMENDY
+// =======================
+void handle_serial(hx711_t *dev)
+{
+    uint8_t data[64];
+    int len = uart_read_bytes(UART_PORT, data, sizeof(data) - 1, 10 / portTICK_PERIOD_MS);
+
+    if (len > 0)
+    {
+        data[len] = 0;
+
+        if (strstr((char*)data, "tare"))
+        {
+            hx711_tare(dev);
+        }
+        else if (strstr((char*)data, "cal"))
+        {
+            float w;
+            sscanf((char*)data, "cal %f", &w);
+            hx711_calibrate(dev, w);
+        }
+    }
+}
+
+// =======================
+// 🚀 MAIN
+// =======================
+void app_main()
+{
+    // UART init (jeśli potrzebny)
+    uart_driver_install(UART_PORT, 1024, 0, 0, NULL, 0);
+
+    hx711_t dev = {
+        .dout = GPIO_NUM_4,
+        .pd_sck = GPIO_NUM_5,
+        .gain = HX711_GAIN_A_128
+    };
+
+    hx711_init(&dev);
+
+    printf("HX711 ready\n");
+
+    while (1)
+    {
+        float weight = hx711_get_units_smart(&dev);
+
+        printf("Weight: %.3f\n", weight);
+
+        handle_serial(&dev);
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // ~20 Hz
+    }
+}
